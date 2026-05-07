@@ -1,0 +1,7 @@
+bin/
+obj/
+data/
+report.html
+*.user
+.vs/
+token.txt
