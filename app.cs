@@ -33,6 +33,8 @@ query($q: String!, $cursor: String) {
         mergedAt
         additions
         deletions
+        isCrossRepository
+        baseRefName
         labels(first: 50) { nodes { name } }
         closingIssuesReferences(first: 20) {
           nodes {
@@ -250,6 +252,8 @@ PrRecord ParsePr(JsonElement n)
     var mergedAt = n.GetProperty("mergedAt").GetDateTimeOffset();
     int additions = n.GetProperty("additions").GetInt32();
     int deletions = n.GetProperty("deletions").GetInt32();
+    bool isFromFork = n.GetProperty("isCrossRepository").GetBoolean();
+    string baseRefName = n.TryGetProperty("baseRefName", out var brn) ? (brn.GetString() ?? "") : "";
 
     var labels = ExtractLabels(n.GetProperty("labels"));
     var closing = new List<IssueRef>();
@@ -260,7 +264,10 @@ PrRecord ParsePr(JsonElement n)
             ExtractLabels(c.GetProperty("labels"))
         ));
     }
-    return new PrRecord(number, title, body, mergedAt, additions, deletions, labels, closing, new());
+    return new PrRecord(number, title, body, mergedAt, additions, deletions, isFromFork, labels, closing, new())
+    {
+        BaseRefName = baseRefName,
+    };
 }
 
 static List<string> ExtractLabels(JsonElement labels)
@@ -277,46 +284,75 @@ static List<string> ExtractLabels(JsonElement labels)
 
 async Task ResolveMentionedIssuesAsync(HttpClient http, List<PrRecord> prs)
 {
-    // Collect (prIndex, issueNumber) mentions excluding closing references.
-    var perPrMentions = new Dictionary<int, HashSet<int>>(); // pr.Number -> set of issue numbers
+    // For every PR, scan the body and classify issue references into two buckets:
+    //   bodyClosing — references preceded by a closing verb (fix/close/resolve).
+    //                 These are as authoritative as GitHub's parsed closingIssuesReferences,
+    //                 and are folded into tier B during bucketing. Useful when the PR uses a
+    //                 URL instead of #N, or when the closing link wasn't auto-detected
+    //                 (e.g. PRs merged into non-default branches).
+    //   plainMention — bare #N or URL references with no closing verb. Tier C; opt-in only.
+    var perPrBodyClosing = new Dictionary<int, HashSet<int>>();
+    var perPrMentions    = new Dictionary<int, HashSet<int>>();
     var allNumbers = new HashSet<int>();
 
     foreach (var pr in prs)
     {
-        var closingNums = pr.ClosingIssues.Select(c => c.Number).ToHashSet();
-        var found = new HashSet<int>();
-        foreach (Match m in Rx.Mention.Matches(pr.Body))
+        var graphqlClosingNums = pr.ClosingIssues.Select(c => c.Number).ToHashSet();
+
+        var bodyClosing = new HashSet<int>();
+        foreach (Match m in Rx.ClosingRef.Matches(pr.Body))
         {
-            if (int.TryParse(m.Groups[1].Value, out var n) && n != pr.Number && !closingNums.Contains(n))
-                found.Add(n);
+            string s = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+            if (int.TryParse(s, out var n) && n != pr.Number && !graphqlClosingNums.Contains(n))
+                bodyClosing.Add(n);
         }
-        if (found.Count > 0)
+
+        var plainMention = new HashSet<int>();
+        void TryAddMention(string s)
         {
-            perPrMentions[pr.Number] = found;
-            foreach (var n in found) allNumbers.Add(n);
+            if (int.TryParse(s, out var n) && n != pr.Number
+                && !graphqlClosingNums.Contains(n) && !bodyClosing.Contains(n))
+                plainMention.Add(n);
+        }
+        foreach (Match m in Rx.Mention.Matches(pr.Body)) TryAddMention(m.Groups[1].Value);
+        foreach (Match m in Rx.UrlRef.Matches(pr.Body))  TryAddMention(m.Groups[1].Value);
+
+        if (bodyClosing.Count > 0)
+        {
+            perPrBodyClosing[pr.Number] = bodyClosing;
+            foreach (var n in bodyClosing) allNumbers.Add(n);
+        }
+        if (plainMention.Count > 0)
+        {
+            perPrMentions[pr.Number] = plainMention;
+            foreach (var n in plainMention) allNumbers.Add(n);
         }
     }
 
     if (allNumbers.Count == 0)
     {
-        Console.WriteLine("No plain #N mentions to resolve.");
+        Console.WriteLine("No body issue references to resolve.");
         return;
     }
 
-    Console.WriteLine($"Resolving labels for {allNumbers.Count} mentioned issues...");
+    Console.WriteLine($"Resolving labels for {allNumbers.Count} referenced issues ({perPrBodyClosing.Sum(kv => kv.Value.Count)} closing-verb, {perPrMentions.Sum(kv => kv.Value.Count)} plain)...");
     var labelMap = await BatchFetchIssueLabelsAsync(http, allNumbers.ToList());
 
-    // Attach back to PRs.
     var byNumber = prs.ToDictionary(p => p.Number);
+    foreach (var (prNumber, issueNums) in perPrBodyClosing)
+    {
+        var pr = byNumber[prNumber];
+        foreach (var n in issueNums)
+            if (labelMap.TryGetValue(n, out var labels))
+                pr.BodyClosingIssues.Add(new IssueRef(n, labels));
+    }
     foreach (var (prNumber, issueNums) in perPrMentions)
     {
         var pr = byNumber[prNumber];
         foreach (var n in issueNums)
-        {
             if (labelMap.TryGetValue(n, out var labels))
                 pr.MentionedIssues.Add(new IssueRef(n, labels));
-            // If labelMap doesn't contain n, it was likely a PR (not an issue) or non-existent — skip silently.
-        }
+        // If labelMap doesn't contain n, it was likely a PR (not an issue) or non-existent — skip silently.
     }
 }
 
@@ -459,6 +495,7 @@ int RunReport(string[] argv)
     var (flags, _) = ParseFlags(argv);
     string cachePath = flags.GetValueOrDefault("in", DefaultCachePath);
     string outPath = flags.GetValueOrDefault("out", DefaultReportPath);
+    string releasesPath = flags.GetValueOrDefault("releases", "release-dates.csv");
     bool includeMentions = flags.ContainsKey("include-mentions");
 
     if (!File.Exists(cachePath))
@@ -468,28 +505,52 @@ int RunReport(string[] argv)
     }
 
     var cache = JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(cachePath), jsonOpts)!;
-    var (buckets, skippedCount, skippedNumbers) = BuildBuckets(cache.Prs, includeMentions);
+    var releases = LoadReleases(releasesPath);
+    if (releases.Count == 0)
+        Console.Error.WriteLine($"WARN: release dates file '{releasesPath}' not found or empty — tier D (date-based) inference disabled.");
+    else
+        Console.WriteLine($"Loaded {releases.Count} releases from {releasesPath}.");
 
-    Console.WriteLine($"Buckets: {buckets.Count}; PRs charted: {buckets.Sum(b => b.PrCount)}; skipped (no release label): {skippedCount}");
+    var (buckets, skippedCount, skippedNumbers, inferredCount) = BuildBuckets(cache.Prs, includeMentions, releases);
 
-    var html = RenderHtml(cache, buckets, skippedCount, skippedNumbers, includeMentions);
+    int hqTotal = buckets.Sum(b => b.Hq.Count);
+    int comTotal = buckets.Sum(b => b.Community.Count);
+    int unkTotal = buckets.Sum(b => b.Unknown.Count);
+    int charted = buckets.Sum(b => b.TotalCount);
+    int fromLabels = charted - inferredCount;
+    Console.WriteLine($"Buckets: {buckets.Count}; PRs charted: {charted} ({fromLabels} from labels, {inferredCount} inferred from base+date) — HQ {hqTotal}, community {comTotal}{(unkTotal > 0 ? $", unknown {unkTotal}" : "")}; skipped: {skippedCount}");
+    if (unkTotal > 0)
+        Console.WriteLine($"NOTE: {unkTotal} cached PR(s) lack fork status. Run `dotnet run app.cs -- fetch --force` to backfill.");
+
+    var html = RenderHtml(cache, buckets, skippedCount, skippedNumbers, includeMentions, inferredCount);
     File.WriteAllText(outPath, html);
     Console.WriteLine($"Wrote {outPath}");
     return 0;
 }
 
-static (List<Bucket> Buckets, int Skipped, List<int> SkippedSample) BuildBuckets(List<PrRecord> prs, bool includeMentions)
+static (List<Bucket> Buckets, int Skipped, List<int> SkippedSample, int Inferred) BuildBuckets(List<PrRecord> prs, bool includeMentions, List<Release> releases)
 {
-    var agg = new Dictionary<(int Major, int Minor), (int Count, long Churn, List<int> Nums)>();
+    // Per bucket, we accumulate three slices keyed by author origin:
+    //   hq        — PR raised from a branch in umbraco/Umbraco-CMS itself (only HQ has push access)
+    //   community — PR raised from a fork (isCrossRepository == true)
+    //   unknown   — legacy cache records where the flag wasn't captured (clear with `fetch --force`)
+    var agg = new Dictionary<(int Major, int Minor), (List<int> Hq, long HqChurn, List<int> Com, long ComChurn, List<int> Unk, long UnkChurn)>();
     int skipped = 0;
+    int inferred = 0;
     var skippedSample = new List<int>();
 
     foreach (var pr in prs)
     {
-        // Tier A: PR's own labels.  Tier B: closing-issue labels.  Tier C: mentioned-issue labels (opt-in fallback).
-        // Use the lowest non-empty tier — prevents stale plain-#N mentions overriding real PR/closing labels.
+        // Tier A: PR's own labels.
+        // Tier B: closing-issue labels — both GitHub-parsed (closingIssuesReferences) and body-parsed
+        //         (Fixes/Closes/Resolves + #N or URL).
+        // Tier C: bare-mention labels (opt-in fallback; noisier).
+        // Tier D: inferred from base branch + merge date when A/B/C all fail.
+        // Use the lowest non-empty tier — prevents stale plain mentions overriding real PR/closing labels.
         var tierA = ParseReleaseTuples(pr.Labels);
-        var tierB = ParseReleaseTuples(pr.ClosingIssues.SelectMany(c => c.Labels));
+        var tierB = ParseReleaseTuples(
+            pr.ClosingIssues.SelectMany(c => c.Labels)
+                .Concat(pr.BodyClosingIssues.SelectMany(c => c.Labels)));
         var tierC = includeMentions ? ParseReleaseTuples(pr.MentionedIssues.SelectMany(m => m.Labels)) : new List<(int, int)>();
 
         var pool = tierA.Count > 0 ? tierA : tierB.Count > 0 ? tierB : tierC;
@@ -501,16 +562,28 @@ static (List<Bucket> Buckets, int Skipped, List<int> SkippedSample) BuildBuckets
 
         if (earliest is null)
         {
+            earliest = InferFromBase(pr.BaseRefName, pr.MergedAt, releases);
+            if (earliest is not null) inferred++;
+        }
+
+        if (earliest is null)
+        {
             skipped++;
             if (skippedSample.Count < 50) skippedSample.Add(pr.Number);
             continue;
         }
 
         var key = earliest.Value;
-        if (!agg.TryGetValue(key, out var v)) v = (0, 0, new List<int>());
-        v.Count++;
-        v.Churn += pr.Additions + pr.Deletions;
-        v.Nums.Add(pr.Number);
+        if (!agg.TryGetValue(key, out var v))
+            v = (new List<int>(), 0L, new List<int>(), 0L, new List<int>(), 0L);
+
+        long churn = pr.Additions + pr.Deletions;
+        switch (pr.IsFromFork)
+        {
+            case false: v.Hq.Add(pr.Number);  v.HqChurn  += churn; break;
+            case true:  v.Com.Add(pr.Number); v.ComChurn += churn; break;
+            case null:  v.Unk.Add(pr.Number); v.UnkChurn += churn; break;
+        }
         agg[key] = v;
     }
 
@@ -519,10 +592,11 @@ static (List<Bucket> Buckets, int Skipped, List<int> SkippedSample) BuildBuckets
         .Select(kv => new Bucket(
             $"{kv.Key.Major}.{kv.Key.Minor}",
             kv.Key.Major, kv.Key.Minor,
-            kv.Value.Count, kv.Value.Churn,
-            kv.Value.Nums.OrderBy(n => n).ToList()))
+            new BucketSlice(kv.Value.Hq.Count,  kv.Value.HqChurn,  kv.Value.Hq.OrderBy(n => n).ToList()),
+            new BucketSlice(kv.Value.Com.Count, kv.Value.ComChurn, kv.Value.Com.OrderBy(n => n).ToList()),
+            new BucketSlice(kv.Value.Unk.Count, kv.Value.UnkChurn, kv.Value.Unk.OrderBy(n => n).ToList())))
         .ToList();
-    return (buckets, skipped, skippedSample);
+    return (buckets, skipped, skippedSample, inferred);
 }
 
 static List<(int Major, int Minor)> ParseReleaseTuples(IEnumerable<string> labels)
@@ -537,14 +611,25 @@ static List<(int Major, int Minor)> ParseReleaseTuples(IEnumerable<string> label
     return list;
 }
 
-string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> skippedSample, bool includeMentions)
+string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> skippedSample, bool includeMentions, int inferredCount)
 {
+    bool anyUnknown = buckets.Any(b => b.Unknown.Count > 0);
     var data = new
     {
         labels = buckets.Select(b => b.Minor).ToArray(),
-        prCount = buckets.Select(b => b.PrCount).ToArray(),
-        churn = buckets.Select(b => b.TotalChurn).ToArray(),
-        prsByBucket = buckets.ToDictionary(b => b.Minor, b => b.PrNumbers),
+        hqPrCount        = buckets.Select(b => b.Hq.Count).ToArray(),
+        communityPrCount = buckets.Select(b => b.Community.Count).ToArray(),
+        unknownPrCount   = buckets.Select(b => b.Unknown.Count).ToArray(),
+        hqChurn          = buckets.Select(b => b.Hq.Churn).ToArray(),
+        communityChurn   = buckets.Select(b => b.Community.Churn).ToArray(),
+        unknownChurn     = buckets.Select(b => b.Unknown.Churn).ToArray(),
+        prsByBucket = buckets.ToDictionary(b => b.Minor, b => new
+        {
+            hq        = b.Hq.PrNumbers,
+            community = b.Community.PrNumbers,
+            unknown   = b.Unknown.PrNumbers,
+        }),
+        anyUnknown,
     };
     string dataJson = JsonSerializer.Serialize(data, new JsonSerializerOptions
     {
@@ -554,7 +639,14 @@ string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> 
 
     string fetched = cache.FetchedAt.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture);
     string window = $"{cache.WindowFrom:yyyy-MM-dd} → {cache.WindowTo:yyyy-MM-dd}";
-    int charted = buckets.Sum(b => b.PrCount);
+    int charted = buckets.Sum(b => b.TotalCount);
+    int hqTotal = buckets.Sum(b => b.Hq.Count);
+    int comTotal = buckets.Sum(b => b.Community.Count);
+    int unkTotal = buckets.Sum(b => b.Unknown.Count);
+    string splitNote = $"HQ: {hqTotal} · Community: {comTotal}" + (unkTotal > 0 ? $" · Unknown: {unkTotal}" : "");
+    string unknownNote = unkTotal > 0
+        ? $"<div class=\"note\">{unkTotal} cached PR(s) predate the HQ/community split — refetch with <code>--force</code> to backfill.</div>"
+        : "";
     string skipNote = skipped == 0
         ? "0 PRs without any release label."
         : $"{skipped} PRs had no release label and are not charted." + (skippedSample.Count > 0 ? $" Sample: {string.Join(", ", skippedSample.Take(20).Select(n => $"#{n}"))}" : "");
@@ -567,16 +659,18 @@ string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> 
 <title>Umbraco-CMS release stats</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; max-width: 1100px; color: #222; }
+  body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; max-width: 1600px; color: #222; }
   h1 { margin-bottom: .25rem; }
   .meta { color: #666; font-size: .9rem; margin-bottom: 1.5rem; }
   .meta a { color: #0366d6; }
-  .chart-wrap { margin: 2rem 0; }
+  .chart-wrap { margin: 2rem 0; height: 420px; position: relative; }
   details { margin: .5rem 0; padding: .5rem .8rem; background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; }
   summary { cursor: pointer; font-weight: 600; }
-  .pr-list { columns: 4; column-gap: 1.5rem; margin-top: .75rem; font-size: .9rem; }
+  .pr-list { columns: 4; column-gap: 1.5rem; margin-top: .25rem; font-size: .9rem; }
   .pr-list a { color: #0366d6; text-decoration: none; }
   .pr-list a:hover { text-decoration: underline; }
+  .slice { margin-top: .75rem; }
+  .slice-head { font-size: .9rem; }
   .note { color: #888; font-size: .85rem; margin: 1rem 0; padding: .75rem; background: #fff8e1; border-left: 3px solid #ffb300; }
 </style>
 </head>
@@ -586,24 +680,26 @@ string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> 
   Repo: <a href="https://github.com/{{Owner}}/{{Repo}}">{{Owner}}/{{Repo}}</a> ·
   Window: {{window}} ·
   Generated: {{fetched}} ·
-  PRs charted: {{charted}} across {{buckets.Count}} minor releases.
+  PRs charted: {{charted}} across {{buckets.Count}} minor releases ({{splitNote}}).
 </div>
 
 <div class="note">
   Bucketing rules: each PR is bucketed into the <strong>earliest</strong> <code>release/X.Y.Z</code>
   label found, looking first at the PR's own labels, then at issues it closes via
-  <code>Fixes/Closes/Resolves #N</code>{{(includeMentions ? ", then at issues it merely mentions via #N (opt-in via --include-mentions; noisier — stale dependabot links can mis-bucket)" : "")}}.
-  Lines-of-code is <strong>additions + deletions</strong> (churn). {{skipNote}}
+  <code>Fixes/Closes/Resolves #N</code> or the equivalent issue URL in the body{{(includeMentions ? ", then at issues it merely mentions via #N or URL (opt-in via --include-mentions; noisier — stale dependabot links can mis-bucket)" : "")}}. If no release label is found anywhere, the PR is allocated by base branch + merge date ({{inferredCount}} PRs in this run) — <code>release/X.Y</code> base maps directly; <code>vN/...</code> base sets the major to <em>N</em> and the minor to the first <em>N.Y.0</em> stable shipped after the merge; <code>main</code> infers the major as the next stable; <code>contrib</code> uses the major currently released at the time.
+  Lines-of-code is <strong>additions + deletions</strong> (churn).
+  <strong>HQ</strong> = PR raised from a branch in the main repo (push access required); <strong>Community</strong> = PR raised from a fork. {{skipNote}}
 </div>
+{{unknownNote}}
 
 <div class="chart-wrap">
   <h2>PRs per minor release</h2>
-  <canvas id="prChart" height="120"></canvas>
+  <canvas id="prChart"></canvas>
 </div>
 
 <div class="chart-wrap">
   <h2>Churn (lines added + deleted) per minor release</h2>
-  <canvas id="locChart" height="120"></canvas>
+  <canvas id="locChart"></canvas>
 </div>
 
 <h2>PRs in each bucket</h2>
@@ -613,36 +709,69 @@ string RenderHtml(CacheFile cache, List<Bucket> buckets, int skipped, List<int> 
 <script>
   const data = JSON.parse(document.getElementById('data').textContent);
   const ghUrl = (n) => `https://github.com/{{Owner}}/{{Repo}}/pull/${n}`;
+  const COLORS = { hq: '#0366d6', community: '#28a745', unknown: '#999999' };
+
+  const baseDatasets = (counts) => {
+    const sets = [
+      { label: 'HQ',        data: counts.hq,        backgroundColor: COLORS.hq },
+      { label: 'Community', data: counts.community, backgroundColor: COLORS.community },
+    ];
+    if (data.anyUnknown)
+      sets.push({ label: 'Unknown', data: counts.unknown, backgroundColor: COLORS.unknown });
+    return sets;
+  };
+
+  const stackedOpts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: {
+        stacked: true,
+        ticks: { autoSkip: false, maxRotation: 60, minRotation: 60 }
+      },
+      y: { stacked: true, beginAtZero: true }
+    }
+  };
 
   new Chart(document.getElementById('prChart'), {
     type: 'bar',
     data: {
       labels: data.labels,
-      datasets: [{ label: 'PRs', data: data.prCount, backgroundColor: '#0366d6' }]
+      datasets: baseDatasets({ hq: data.hqPrCount, community: data.communityPrCount, unknown: data.unknownPrCount })
     },
-    options: { responsive: true, scales: { y: { beginAtZero: true } } }
+    options: stackedOpts
   });
 
   new Chart(document.getElementById('locChart'), {
     type: 'bar',
     data: {
       labels: data.labels,
-      datasets: [{ label: 'Lines of code (added + deleted)', data: data.churn, backgroundColor: '#28a745' }]
+      datasets: baseDatasets({ hq: data.hqChurn, community: data.communityChurn, unknown: data.unknownChurn })
     },
-    options: { responsive: true, scales: { y: { beginAtZero: true } } }
+    options: stackedOpts
   });
 
+  const renderLinks = (nums) => nums.map(n => `<a href="${ghUrl(n)}" target="_blank">#${n}</a>`).join('<br>');
   const list = document.getElementById('bucketList');
   for (const minor of data.labels) {
-    const nums = data.prsByBucket[minor] || [];
+    const slices = data.prsByBucket[minor] || { hq: [], community: [], unknown: [] };
+    const total = slices.hq.length + slices.community.length + slices.unknown.length;
     const det = document.createElement('details');
     const sum = document.createElement('summary');
-    sum.textContent = `${minor}  —  ${nums.length} PR(s)`;
+    const parts = [`HQ ${slices.hq.length}`, `community ${slices.community.length}`];
+    if (slices.unknown.length) parts.push(`unknown ${slices.unknown.length}`);
+    sum.textContent = `${minor}  —  ${total} PR(s)  (${parts.join(', ')})`;
     det.appendChild(sum);
-    const ul = document.createElement('div');
-    ul.className = 'pr-list';
-    ul.innerHTML = nums.map(n => `<a href="${ghUrl(n)}" target="_blank">#${n}</a>`).join('<br>');
-    det.appendChild(ul);
+    const body = document.createElement('div');
+    const section = (label, color, nums) => {
+      if (!nums.length) return '';
+      return `<div class="slice"><div class="slice-head" style="color:${color}"><strong>${label} (${nums.length})</strong></div><div class="pr-list">${renderLinks(nums)}</div></div>`;
+    };
+    body.innerHTML =
+      section('HQ', COLORS.hq, slices.hq) +
+      section('Community', COLORS.community, slices.community) +
+      section('Unknown', COLORS.unknown, slices.unknown);
+    det.appendChild(body);
     list.appendChild(det);
   }
 </script>
@@ -682,6 +811,110 @@ static (Dictionary<string, string> Flags, List<string> Positional) ParseFlags(st
 static DateTimeOffset ParseDate(string s) =>
     DateTimeOffset.ParseExact(s, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
 
+static List<Release> LoadReleases(string path)
+{
+    if (!File.Exists(path)) return new();
+    var list = new List<Release>();
+    var lines = File.ReadAllLines(path);
+    for (int i = 1; i < lines.Length; i++) // skip header
+    {
+        var parts = lines[i].Split(',');
+        if (parts.Length < 2) continue;
+        var ver = parts[0].Trim();
+        if (!DateTimeOffset.TryParseExact(parts[1].Trim(), "yyyy-MM-dd",
+                CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
+            continue;
+
+        int? major = null, minor = null, patch = null;
+        var m = Rx.StableVersion.Match(ver);
+        if (m.Success)
+        {
+            major = int.Parse(m.Groups[1].Value);
+            minor = int.Parse(m.Groups[2].Value);
+            patch = int.Parse(m.Groups[3].Value);
+        }
+        else
+        {
+            // Pre-release: capture leading major.minor.patch for sorting; flagged as pre-release.
+            var m2 = Regex.Match(ver, @"^(\d+)\.(\d+)\.(\d+)");
+            if (m2.Success)
+            {
+                major = int.Parse(m2.Groups[1].Value);
+                minor = int.Parse(m2.Groups[2].Value);
+                patch = int.Parse(m2.Groups[3].Value);
+            }
+        }
+        list.Add(new Release(ver, date, major, minor, patch, IsPreRelease: ver.Contains('-')));
+    }
+    return list;
+}
+
+// Tier D: when a PR carries no release label anywhere, infer the bucket from its base branch + merge date.
+//   release/X.Y[.Z]  → direct (X, Y).
+//   vN/*             → major = N; minor = first stable N.Y.0 released after mergedAt.
+//   main             → major = first stable M.0.0 released after mergedAt; minor inferred as above.
+//   anything else    → null (skip).
+static (int Major, int Minor)? InferFromBase(string baseRef, DateTimeOffset mergedAt, List<Release> releases)
+{
+    if (string.IsNullOrEmpty(baseRef) || releases.Count == 0) return null;
+
+    var rm = Rx.BaseReleaseBranch.Match(baseRef);
+    if (rm.Success) return (int.Parse(rm.Groups[1].Value), int.Parse(rm.Groups[2].Value));
+
+    int? major = null;
+    var vm = Rx.BaseVPrefix.Match(baseRef);
+    if (vm.Success)
+    {
+        major = int.Parse(vm.Groups[1].Value);
+    }
+    else if (baseRef.Equals("main", StringComparison.OrdinalIgnoreCase))
+    {
+        // Smallest M such that M.0.0 was released stably after mergedAt — that's the major
+        // main was being developed toward at the merge moment.
+        var nextMajor = releases
+            .Where(r => !r.IsPreRelease && r.Minor == 0 && r.Patch == 0 && r.Released > mergedAt)
+            .OrderBy(r => r.Released)
+            .FirstOrDefault();
+        if (nextMajor is not null)
+        {
+            major = nextMajor.Major;
+        }
+        else
+        {
+            // PR merged after every known stable major release — main is now developing
+            // the as-yet-unreleased major beyond the latest seen.
+            var latestMajor = releases.Where(r => !r.IsPreRelease && r.Major.HasValue).Max(r => r.Major) ?? 0;
+            major = latestMajor + 1;
+        }
+    }
+    else if (baseRef.Equals("contrib", StringComparison.OrdinalIgnoreCase))
+    {
+        // contrib historically tracked the currently-released major (community contributions to
+        // the maintained line, not main). Use the largest M such that M.0.0 shipped on/before the merge.
+        var currentMajor = releases
+            .Where(r => !r.IsPreRelease && r.Minor == 0 && r.Patch == 0 && r.Released <= mergedAt)
+            .OrderByDescending(r => r.Released)
+            .FirstOrDefault();
+        major = currentMajor?.Major;
+    }
+    if (major is null) return null;
+
+    var nextMinor = releases
+        .Where(r => !r.IsPreRelease && r.Major == major && r.Patch == 0 && r.Released > mergedAt)
+        .OrderBy(r => r.Released)
+        .FirstOrDefault();
+    if (nextMinor is not null) return (major.Value, nextMinor.Minor!.Value);
+
+    // No future X.Y.0 stable release for this major. Either the PR shipped (or will ship) in
+    // the next-after-latest minor, or the major has no stable releases yet (assume X.0 is the target).
+    var latestMinor = releases
+        .Where(r => !r.IsPreRelease && r.Major == major && r.Minor.HasValue)
+        .Select(r => r.Minor!.Value)
+        .DefaultIfEmpty(-1)
+        .Max();
+    return (major.Value, latestMinor + 1);
+}
+
 static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
 static DateTimeOffset Max(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
 
@@ -691,9 +924,27 @@ static DateTimeOffset Max(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
 
 static class Rx
 {
+    // Issue refs in PR bodies come in two forms, both of which we want to detect:
+    //   #1234                                                              (Mention)
+    //   https://github.com/umbraco/Umbraco-CMS/{issues|pull}/1234           (UrlRef)
+    private const string RepoUrl = @"https?://github\.com/umbraco/Umbraco-CMS";
     public static readonly Regex Mention = new(@"(?<![\w/])#(\d+)\b", RegexOptions.Compiled);
+    public static readonly Regex UrlRef  = new(RepoUrl + @"/(?:issues|pull)/(\d+)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // Closing-verb prefixed refs: treat as equivalent to GitHub's `closingIssuesReferences` (tier B).
+    // Verbs per GitHub's spec: close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved.
+    // Group 1 captures #N form; group 2 captures the URL form.
+    public static readonly Regex ClosingRef = new(
+        @"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+(?:#(\d+)\b|" + RepoUrl + @"/(?:issues|pull)/(\d+)\b)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     public static readonly Regex ReleaseLabel = new(@"^release/(\d+)\.(\d+)\.\d+(?:[-+].*)?$", RegexOptions.Compiled);
+    // Base-branch patterns used by tier D (date-based fallback).
+    public static readonly Regex BaseReleaseBranch = new(@"^release/(\d+)\.(\d+)(?:[./]|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    public static readonly Regex BaseVPrefix = new(@"^v(\d+)/", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    public static readonly Regex StableVersion = new(@"^(\d+)\.(\d+)\.(\d+)$", RegexOptions.Compiled);
 }
+
+record Release(string Version, DateTimeOffset Released, int? Major, int? Minor, int? Patch, bool IsPreRelease);
 
 record IssueRef(int Number, List<string> Labels);
 
@@ -704,10 +955,19 @@ record PrRecord(
     DateTimeOffset MergedAt,
     int Additions,
     int Deletions,
+    bool? IsFromFork,
     List<string> Labels,
     List<IssueRef> ClosingIssues,
     List<IssueRef> MentionedIssues
-);
+)
+{
+    // Body-parsed closing references (Fixes/Closes/Resolves + #N or URL). Treated as tier B.
+    // Non-positional with default so old cache files (no field) deserialize to an empty list.
+    public List<IssueRef> BodyClosingIssues { get; init; } = new();
+    // Base branch the PR was merged into (e.g. "main", "v13/dev", "release/13.5.0").
+    // Used by the date-based fallback bucketing (tier D). Empty for legacy cache rows.
+    public string BaseRefName { get; init; } = "";
+}
 
 record CacheFile(
     DateTimeOffset FetchedAt,
@@ -716,4 +976,16 @@ record CacheFile(
     List<PrRecord> Prs
 );
 
-record Bucket(string Minor, int Major, int MinorNum, int PrCount, long TotalChurn, List<int> PrNumbers);
+record BucketSlice(int Count, long Churn, List<int> PrNumbers)
+{
+    public static BucketSlice Empty() => new(0, 0, new List<int>());
+}
+
+record Bucket(
+    string Minor, int Major, int MinorNum,
+    BucketSlice Hq, BucketSlice Community, BucketSlice Unknown
+)
+{
+    public int TotalCount => Hq.Count + Community.Count + Unknown.Count;
+    public long TotalChurn => Hq.Churn + Community.Churn + Unknown.Churn;
+}
